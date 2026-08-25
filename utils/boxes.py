@@ -9,17 +9,20 @@ def decode_predictions(
     topk=300,
 ):
     """
-    Decode anchor-free detector outputs into bounding boxes.
+    Decode V3 anchor-free predictions.
 
-    The detector predicts, for every FPN location:
-      - class scores
-      - left/top/right/bottom box distances
-      - center-ness score
+    The model predicts l/t/r/b distances normalized by
+    the corresponding FPN stride.
 
-    During this diagnostic stage, classification probability is used
-    directly as the confidence score. Center-ness is not multiplied
-    into the classification score because the trained model currently
-    produces very low center-ness values.
+    Therefore:
+
+        pixel_distance = predicted_distance * stride
+
+    Confidence uses:
+
+        class_probability * centerness
+
+    This matches the V3 training formulation.
     """
 
     strides = {
@@ -28,23 +31,38 @@ def decode_predictions(
         "p5": 32,
     }
 
-    batch_size = next(iter(outputs.values()))["cls"].shape[0]
+    batch_size = next(
+        iter(outputs.values())
+    )["cls"].shape[0]
 
-    batch_boxes = [[] for _ in range(batch_size)]
-    batch_scores = [[] for _ in range(batch_size)]
-    batch_labels = [[] for _ in range(batch_size)]
+    batch_boxes = [
+        [] for _ in range(batch_size)
+    ]
+
+    batch_scores = [
+        [] for _ in range(batch_size)
+    ]
+
+    batch_labels = [
+        [] for _ in range(batch_size)
+    ]
 
     for level, stride in strides.items():
 
         pred = outputs[level]
 
         cls = pred["cls"].sigmoid()
+
+        center = (
+            pred["center"].sigmoid()
+        )
+
         box = pred["box"]
-        center = pred["center"].sigmoid()
 
-        bsz, num_classes, h, w = cls.shape
+        bsz, num_classes, h, w = (
+            cls.shape
+        )
 
-        # Grid locations
         yy, xx = torch.meshgrid(
             torch.arange(
                 h,
@@ -57,35 +75,42 @@ def decode_predictions(
             indexing="ij",
         )
 
-        px = (xx.float() + 0.5) * stride
-        py = (yy.float() + 0.5) * stride
+        cx = (
+            xx.float() + 0.5
+        ) * stride
+
+        cy = (
+            yy.float() + 0.5
+        ) * stride
 
         for b in range(bsz):
 
-            # -------------------------------------------------
-            # Classification confidence
-            # -------------------------------------------------
-            #
-            # Diagnostic version:
-            # confidence = class probability
-            #
-            # We are intentionally NOT doing:
-            #
-            # cls * center
-            #
-            # because the center predictions are currently
-            # extremely small.
-            # -------------------------------------------------
+            # --------------------------------------------------
+            # Class × centerness confidence
+            # --------------------------------------------------
+
+            combined = (
+                cls[b]
+                *
+                center[b]
+            )
 
             scores, labels = (
-                cls[b]
-                .reshape(num_classes, -1)
+                combined
+                .reshape(
+                    num_classes,
+                    -1,
+                )
                 .max(dim=0)
             )
 
-            keep = scores > score_threshold
+            keep = (
+                scores
+                >= score_threshold
+            )
 
             if not keep.any():
+
                 batch_boxes[b].append(
                     torch.empty(
                         (0, 4),
@@ -110,29 +135,48 @@ def decode_predictions(
 
                 continue
 
-            # -------------------------------------------------
-            # Select locations above confidence threshold
-            # -------------------------------------------------
+            flat_indices = (
+                torch.arange(
+                    h * w,
+                    device=cls.device,
+                )[keep]
+            )
 
-            flat_indices = torch.arange(
-                h * w,
-                device=cls.device,
-            )[keep]
+            iy = (
+                flat_indices // w
+            )
 
-            iy = flat_indices // w
-            ix = flat_indices % w
+            ix = (
+                flat_indices % w
+            )
 
-            cx = px[iy, ix]
-            cy = py[iy, ix]
+            point_x = (
+                cx[iy, ix]
+            )
 
-            # -------------------------------------------------
-            # Predicted box distances
-            # -------------------------------------------------
+            point_y = (
+                cy[iy, ix]
+            )
+
+            # --------------------------------------------------
+            # Normalized distances → pixel distances
+            # --------------------------------------------------
 
             distances = (
                 box[b]
-                .permute(1, 2, 0)
-                .reshape(-1, 4)[keep]
+                .permute(
+                    1,
+                    2,
+                    0,
+                )
+                .reshape(
+                    -1,
+                    4,
+                )[keep]
+            )
+
+            distances = (
+                distances * stride
             )
 
             left = distances[:, 0]
@@ -140,33 +184,41 @@ def decode_predictions(
             right = distances[:, 2]
             bottom = distances[:, 3]
 
-            # -------------------------------------------------
-            # Convert distances to xyxy boxes
-            # -------------------------------------------------
+            # --------------------------------------------------
+            # Decode xyxy
+            # --------------------------------------------------
 
             decoded = torch.stack(
                 [
-                    cx - left,
-                    cy - top,
-                    cx + right,
-                    cy + bottom,
+                    point_x - left,
+                    point_y - top,
+                    point_x + right,
+                    point_y + bottom,
                 ],
                 dim=1,
             )
 
             decoded = decoded.clamp(
-                min=0,
-                max=224,
+                min=0.0,
+                max=224.0,
             )
 
-            current_scores = scores[keep]
-            current_labels = labels[keep]
+            current_scores = (
+                scores[keep]
+            )
 
-            # -------------------------------------------------
-            # Keep only top-k predictions per feature level
-            # -------------------------------------------------
+            current_labels = (
+                labels[keep]
+            )
 
-            if current_scores.numel() > topk:
+            # --------------------------------------------------
+            # Per-level top-k
+            # --------------------------------------------------
+
+            if (
+                current_scores.numel()
+                > topk
+            ):
 
                 indices = (
                     current_scores
@@ -174,61 +226,43 @@ def decode_predictions(
                     .indices
                 )
 
-                decoded = decoded[indices]
+                decoded = (
+                    decoded[indices]
+                )
 
                 current_scores = (
-                    current_scores[indices]
+                    current_scores[
+                        indices
+                    ]
                 )
 
                 current_labels = (
-                    current_labels[indices]
+                    current_labels[
+                        indices
+                    ]
                 )
 
-            batch_boxes[b].append(decoded)
-            batch_scores[b].append(current_scores)
-            batch_labels[b].append(current_labels)
+            batch_boxes[b].append(
+                decoded
+            )
 
-    # ---------------------------------------------------------
-    # Combine all FPN levels for every image
-    # ---------------------------------------------------------
+            batch_scores[b].append(
+                current_scores
+            )
+
+            batch_labels[b].append(
+                current_labels
+            )
+
+    # ----------------------------------------------------------
+    # Combine FPN levels
+    # ----------------------------------------------------------
 
     final_boxes = []
     final_scores = []
     final_labels = []
 
     for b in range(batch_size):
-
-        if len(batch_boxes[b]) == 0:
-
-            final_boxes.append(
-                torch.empty(
-                    (0, 4),
-                    device=next(iter(outputs.values()))[
-                        "cls"
-                    ].device,
-                )
-            )
-
-            final_scores.append(
-                torch.empty(
-                    (0,),
-                    device=next(iter(outputs.values()))[
-                        "cls"
-                    ].device,
-                )
-            )
-
-            final_labels.append(
-                torch.empty(
-                    (0,),
-                    dtype=torch.long,
-                    device=next(iter(outputs.values()))[
-                        "cls"
-                    ].device,
-                )
-            )
-
-            continue
 
         boxes = torch.cat(
             batch_boxes[b],
@@ -245,9 +279,9 @@ def decode_predictions(
             dim=0,
         )
 
-        # -----------------------------------------------------
+        # ------------------------------------------------------
         # Class-aware NMS
-        # -----------------------------------------------------
+        # ------------------------------------------------------
 
         if boxes.numel() > 0:
 
@@ -262,9 +296,17 @@ def decode_predictions(
             scores = scores[keep]
             labels = labels[keep]
 
-        final_boxes.append(boxes)
-        final_scores.append(scores)
-        final_labels.append(labels)
+        final_boxes.append(
+            boxes
+        )
+
+        final_scores.append(
+            scores
+        )
+
+        final_labels.append(
+            labels
+        )
 
     return (
         final_boxes,

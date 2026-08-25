@@ -7,12 +7,14 @@ import torch.nn.functional as F
 
 class DetectionHead(nn.Module):
     """
-    Anchor-free dense detection head.
+    Lightweight anchor-free detection head.
 
     Each FPN location predicts:
       - class logits
-      - box distances: left, top, right, bottom
-      - center/objectness logit
+      - normalized l/t/r/b box distances
+      - centerness/objectness logit
+
+    Box distances are normalized by the FPN stride.
     """
 
     def __init__(self, channels=96, num_classes=20, hidden=96):
@@ -22,11 +24,21 @@ class DetectionHead(nn.Module):
 
         def tower():
             return nn.Sequential(
-                nn.Conv2d(channels, hidden, 3, padding=1),
+                nn.Conv2d(
+                    channels,
+                    hidden,
+                    kernel_size=3,
+                    padding=1,
+                ),
                 nn.GroupNorm(8, hidden),
                 nn.ReLU(inplace=True),
 
-                nn.Conv2d(hidden, hidden, 3, padding=1),
+                nn.Conv2d(
+                    hidden,
+                    hidden,
+                    kernel_size=3,
+                    padding=1,
+                ),
                 nn.GroupNorm(8, hidden),
                 nn.ReLU(inplace=True),
             )
@@ -64,47 +76,58 @@ class DetectionHead(nn.Module):
 
     def _initialize_heads(self):
         """
-        Initialize the dense detection heads with a low foreground
-        prior. This prevents the classifier from starting with
-        extremely large foreground probabilities everywhere.
+        Initialize dense prediction heads.
+
+        Classification and centerness start with a low foreground
+        probability.
+
+        Box distances start around 4 feature-map cells instead of
+        approximately 1 pixel-scale unit.
         """
 
         prior_prob = 0.01
-        bias_value = -math.log(
+
+        prior_bias = -math.log(
             (1.0 - prior_prob) / prior_prob
         )
 
-        for cls_layer in self.cls_pred:
+        for layer in self.cls_pred:
             nn.init.normal_(
-                cls_layer.weight,
+                layer.weight,
                 mean=0.0,
                 std=0.01,
             )
             nn.init.constant_(
-                cls_layer.bias,
-                bias_value,
+                layer.bias,
+                prior_bias,
             )
 
-        for ctr_layer in self.ctr_pred:
+        for layer in self.ctr_pred:
             nn.init.normal_(
-                ctr_layer.weight,
+                layer.weight,
                 mean=0.0,
                 std=0.01,
             )
             nn.init.constant_(
-                ctr_layer.bias,
-                bias_value,
+                layer.bias,
+                prior_bias,
             )
 
-        for box_layer in self.box_pred:
+        # softplus(approximately 4) gives an initial normalized
+        # distance of approximately four feature-map cells.
+        box_bias = math.log(
+            math.exp(4.0) - 1.0
+        )
+
+        for layer in self.box_pred:
             nn.init.normal_(
-                box_layer.weight,
+                layer.weight,
                 mean=0.0,
                 std=0.01,
             )
             nn.init.constant_(
-                box_layer.bias,
-                1.0,
+                layer.bias,
+                box_bias,
             )
 
     def forward(self, pyramid):
@@ -122,6 +145,7 @@ class DetectionHead(nn.Module):
                 cls_features
             )
 
+            # Positive normalized l/t/r/b distances.
             box_distances = F.softplus(
                 self.box_pred[i](box_features)
             )
