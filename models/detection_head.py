@@ -7,17 +7,25 @@ import torch.nn.functional as F
 
 class DetectionHead(nn.Module):
     """
-    Lightweight anchor-free detection head.
+    Anchor-free dense detection head.
 
     Each FPN location predicts:
       - class logits
-      - normalized l/t/r/b box distances
-      - centerness/objectness logit
+      - box distances: left, top, right, bottom
+      - centerness
 
-    Box distances are normalized by the FPN stride.
+    V4 change:
+      - Box regression is initialized to approximately
+        2 feature-map cells instead of 4.
+      - Softplus keeps predicted box distances positive.
     """
 
-    def __init__(self, channels=96, num_classes=20, hidden=96):
+    def __init__(
+        self,
+        channels=96,
+        num_classes=20,
+        hidden=96,
+    ):
         super().__init__()
 
         self.num_classes = num_classes
@@ -27,104 +35,98 @@ class DetectionHead(nn.Module):
                 nn.Conv2d(
                     channels,
                     hidden,
-                    kernel_size=3,
+                    3,
                     padding=1,
                 ),
-                nn.GroupNorm(8, hidden),
-                nn.ReLU(inplace=True),
-
+                nn.GroupNorm(
+                    8,
+                    hidden,
+                ),
+                nn.ReLU(
+                    inplace=True,
+                ),
                 nn.Conv2d(
                     hidden,
                     hidden,
-                    kernel_size=3,
+                    3,
                     padding=1,
                 ),
-                nn.GroupNorm(8, hidden),
-                nn.ReLU(inplace=True),
+                nn.GroupNorm(
+                    8,
+                    hidden,
+                ),
+                nn.ReLU(
+                    inplace=True,
+                ),
             )
 
+        # Separate classification and box towers.
         self.cls_tower = nn.ModuleList(
-            [tower() for _ in range(3)]
+            [
+                tower()
+                for _ in range(3)
+            ]
         )
 
         self.box_tower = nn.ModuleList(
-            [tower() for _ in range(3)]
+            [
+                tower()
+                for _ in range(3)
+            ]
         )
 
+        # Classification prediction.
         self.cls_pred = nn.ModuleList(
             [
-                nn.Conv2d(hidden, num_classes, 1)
+                nn.Conv2d(
+                    hidden,
+                    num_classes,
+                    1,
+                )
                 for _ in range(3)
             ]
         )
 
+        # Box distance prediction.
         self.box_pred = nn.ModuleList(
             [
-                nn.Conv2d(hidden, 4, 1)
+                nn.Conv2d(
+                    hidden,
+                    4,
+                    1,
+                )
                 for _ in range(3)
             ]
         )
 
+        # Centerness prediction.
         self.ctr_pred = nn.ModuleList(
             [
-                nn.Conv2d(hidden, 1, 1)
+                nn.Conv2d(
+                    hidden,
+                    1,
+                    1,
+                )
                 for _ in range(3)
             ]
         )
 
-        self._initialize_heads()
-
-    def _initialize_heads(self):
-        """
-        Initialize dense prediction heads.
-
-        Classification and centerness start with a low foreground
-        probability.
-
-        Box distances start around 4 feature-map cells instead of
-        approximately 1 pixel-scale unit.
-        """
-
-        prior_prob = 0.01
-
-        prior_bias = -math.log(
-            (1.0 - prior_prob) / prior_prob
-        )
-
-        for layer in self.cls_pred:
-            nn.init.normal_(
-                layer.weight,
-                mean=0.0,
-                std=0.01,
-            )
-            nn.init.constant_(
-                layer.bias,
-                prior_bias,
-            )
-
-        for layer in self.ctr_pred:
-            nn.init.normal_(
-                layer.weight,
-                mean=0.0,
-                std=0.01,
-            )
-            nn.init.constant_(
-                layer.bias,
-                prior_bias,
-            )
-
-        # softplus(approximately 4) gives an initial normalized
-        # distance of approximately four feature-map cells.
+        # ---------------------------------------------------------
+        # V4 initialization
+        # ---------------------------------------------------------
+        #
+        # Softplus(x) ~= 2 when:
+        #
+        # x = log(exp(2) - 1)
+        #
+        # Therefore the initial predicted box distance is
+        # approximately 2 feature-map cells.
+        #
         box_bias = math.log(
-            math.exp(4.0) - 1.0
+            math.exp(2.0) - 1.0
         )
 
         for layer in self.box_pred:
-            nn.init.normal_(
-                layer.weight,
-                mean=0.0,
-                std=0.01,
-            )
             nn.init.constant_(
                 layer.bias,
                 box_bias,
@@ -138,26 +140,23 @@ class DetectionHead(nn.Module):
         ):
             x = pyramid[level]
 
-            cls_features = self.cls_tower[i](x)
-            box_features = self.box_tower[i](x)
+            # Classification branch.
+            c = self.cls_tower[i](x)
 
-            cls_logits = self.cls_pred[i](
-                cls_features
-            )
+            # Box + centerness branch.
+            b = self.box_tower[i](x)
 
-            # Positive normalized l/t/r/b distances.
-            box_distances = F.softplus(
-                self.box_pred[i](box_features)
-            )
-
-            center_logits = self.ctr_pred[i](
-                box_features
+            # Positive box distances.
+            box = F.softplus(
+                self.box_pred[i](b)
             )
 
             outputs[level] = {
-                "cls": cls_logits,
-                "box": box_distances,
-                "center": center_logits,
+                "cls": self.cls_pred[i](c),
+
+                "box": box,
+
+                "center": self.ctr_pred[i](b),
             }
 
         return outputs

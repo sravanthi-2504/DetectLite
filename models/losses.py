@@ -8,13 +8,6 @@ def sigmoid_focal_loss(
     alpha=0.25,
     gamma=2.0,
 ):
-    """
-    Numerically stable sigmoid focal loss.
-
-    Returns the unreduced loss so the caller can normalize
-    using the number of positive locations.
-    """
-
     prob = logits.sigmoid()
 
     ce_loss = F.binary_cross_entropy_with_logits(
@@ -28,9 +21,7 @@ def sigmoid_focal_loss(
         + (1.0 - prob) * (1.0 - targets)
     )
 
-    focal_weight = (
-        (1.0 - p_t) ** gamma
-    )
+    focal_weight = (1.0 - p_t) ** gamma
 
     alpha_t = (
         alpha * targets
@@ -40,20 +31,16 @@ def sigmoid_focal_loss(
     return ce_loss * focal_weight * alpha_t
 
 
-def box_iou_loss(
+def box_iou_and_l1_loss(
     pred_dist,
     target_dist,
     px,
     py,
 ):
     """
-    IoU loss for anchor-free l/t/r/b distances.
+    Combined IoU + Smooth-L1 loss.
 
-    Distances are already normalized by the feature-map stride.
-    Therefore both predicted and target distances are in the
-    same coordinate system.
-
-    The point is at (px, py) in normalized feature coordinates.
+    Distances are normalized by the FPN stride.
     """
 
     pred_l = pred_dist[:, 0]
@@ -66,11 +53,13 @@ def box_iou_loss(
     tgt_r = target_dist[:, 2]
     tgt_b = target_dist[:, 3]
 
+    # Predicted box.
     pred_x1 = px - pred_l
     pred_y1 = py - pred_t
     pred_x2 = px + pred_r
     pred_y2 = py + pred_b
 
+    # Ground-truth box.
     tgt_x1 = px - tgt_l
     tgt_y1 = py - tgt_t
     tgt_x2 = px + tgt_r
@@ -131,7 +120,22 @@ def box_iou_loss(
         / union.clamp(min=1e-8)
     )
 
-    return 1.0 - iou
+    iou_loss = 1.0 - iou
+
+    l1_loss = F.smooth_l1_loss(
+        pred_dist,
+        target_dist,
+        reduction="none",
+    ).mean(dim=1)
+
+    # IoU provides geometric overlap learning.
+    # Smooth-L1 provides stable coordinate gradients
+    # when overlap is initially poor.
+    return (
+        0.5 * iou_loss
+        +
+        0.5 * l1_loss
+    )
 
 
 def detection_loss(
@@ -140,15 +144,14 @@ def detection_loss(
     image_size=224,
 ):
     """
-    V3 anchor-free detection loss.
+    V4 anchor-free detection loss.
 
-    Main changes from V2:
+    Changes from V3:
 
-      1. Box distances are normalized by FPN stride.
-      2. Box regression uses IoU loss.
-      3. Classification is normalized by positive locations.
-      4. Centerness uses a continuous target.
-      5. Positive locations receive stronger learning signal.
+      1. Multiple center-region locations are positive.
+      2. Box loss combines IoU and Smooth-L1.
+      3. Box distances remain stride-normalized.
+      4. Centerness remains continuous.
     """
 
     device = next(
@@ -175,8 +178,6 @@ def detection_loss(
         0.0,
         device=device,
     )
-
-    total_positive = 0
 
     num_images = len(targets)
 
@@ -230,7 +231,6 @@ def detection_loss(
                 indexing="ij",
             )
 
-            # Pixel coordinates of feature locations.
             px_pixels = (
                 xx.float() + 0.5
             ) * stride
@@ -239,11 +239,9 @@ def detection_loss(
                 yy.float() + 0.5
             ) * stride
 
-            # Normalized coordinates used by box_iou_loss.
-            px = xx.float() + 0.5
-            py = yy.float() + 0.5
-
-            assigned_objects = 0
+            # --------------------------------------------------
+            # Assign objects to FPN levels.
+            # --------------------------------------------------
 
             for box, label in zip(
                 boxes,
@@ -262,7 +260,6 @@ def detection_loss(
 
                 area = width * height
 
-                # FPN scale assignment.
                 if level == "p3":
                     valid_scale = (
                         area < 64.0 * 64.0
@@ -283,6 +280,13 @@ def detection_loss(
                 if not valid_scale:
                     continue
 
+                # --------------------------------------------------
+                # Center region.
+                #
+                # Instead of ONE positive location, use a central
+                # region covering roughly 40% of the object.
+                # --------------------------------------------------
+
                 cx = (
                     x1 + x2
                 ) / 2.0
@@ -291,93 +295,138 @@ def detection_loss(
                     y1 + y2
                 ) / 2.0
 
-                inside = (
-                    (px_pixels >= x1)
-                    &
-                    (px_pixels <= x2)
-                    &
-                    (py_pixels >= y1)
-                    &
-                    (py_pixels <= y2)
+                center_width = (
+                    width * 0.4
                 )
 
-                if not inside.any():
-                    continue
-
-                distance_to_center = (
-                    (px_pixels - cx) ** 2
-                    +
-                    (py_pixels - cy) ** 2
+                center_height = (
+                    height * 0.4
                 )
 
-                distance_to_center = (
-                    distance_to_center.masked_fill(
-                        ~inside,
-                        float("inf"),
+                center_x1 = (
+                    cx - center_width / 2.0
+                )
+
+                center_x2 = (
+                    cx + center_width / 2.0
+                )
+
+                center_y1 = (
+                    cy - center_height / 2.0
+                )
+
+                center_y2 = (
+                    cy + center_height / 2.0
+                )
+
+                inside_center = (
+                    (px_pixels >= center_x1)
+                    &
+                    (px_pixels <= center_x2)
+                    &
+                    (py_pixels >= center_y1)
+                    &
+                    (py_pixels <= center_y2)
+                )
+
+                # Fallback for very small objects.
+                if not inside_center.any():
+
+                    distances = (
+                        (px_pixels - cx) ** 2
+                        +
+                        (py_pixels - cy) ** 2
                     )
-                )
 
-                flat_index = (
-                    distance_to_center.argmin()
-                )
+                    flat = distances.argmin()
 
-                iy = (
-                    flat_index // w
-                )
+                    iy = flat // w
+                    ix = flat % w
 
-                ix = (
-                    flat_index % w
-                )
+                    inside_center = torch.zeros(
+                        (h, w),
+                        dtype=torch.bool,
+                        device=device,
+                    )
 
-                # Pixel distances.
+                    inside_center[
+                        iy,
+                        ix
+                    ] = True
+
+                # --------------------------------------------------
+                # Distances for ALL positive center locations.
+                # --------------------------------------------------
+
                 left = (
-                    px_pixels[iy, ix] - x1
+                    px_pixels - x1
                 )
 
                 top = (
-                    py_pixels[iy, ix] - y1
+                    py_pixels - y1
                 )
 
                 right = (
-                    x2 - px_pixels[iy, ix]
+                    x2 - px_pixels
                 )
 
                 bottom = (
-                    y2 - py_pixels[iy, ix]
+                    y2 - py_pixels
                 )
 
-                # Normalize distances by stride.
+                valid = (
+                    inside_center
+                    &
+                    (left > 0)
+                    &
+                    (top > 0)
+                    &
+                    (right > 0)
+                    &
+                    (bottom > 0)
+                )
+
+                if not valid.any():
+                    continue
+
+                # Normalized box distances.
                 box_target[
                     0,
-                    iy,
-                    ix,
-                ] = left / stride
+                    valid
+                ] = (
+                    left[valid] / stride
+                )
 
                 box_target[
                     1,
-                    iy,
-                    ix,
-                ] = top / stride
+                    valid
+                ] = (
+                    top[valid] / stride
+                )
 
                 box_target[
                     2,
-                    iy,
-                    ix,
-                ] = right / stride
+                    valid
+                ] = (
+                    right[valid] / stride
+                )
 
                 box_target[
                     3,
-                    iy,
-                    ix,
-                ] = bottom / stride
+                    valid
+                ] = (
+                    bottom[valid] / stride
+                )
 
                 cls_target[
                     int(label),
-                    iy,
-                    ix,
+                    valid
                 ] = 1.0
 
-                # FCOS-style centerness target.
+                # --------------------------------------------------
+                # Continuous centerness.
+                # --------------------------------------------------
+
                 lr_min = torch.minimum(
                     left,
                     right,
@@ -401,30 +450,30 @@ def detection_loss(
                 centerness = torch.sqrt(
                     (
                         lr_min
-                        / lr_max.clamp(min=1e-6)
+                        /
+                        lr_max.clamp(
+                            min=1e-6
+                        )
                     )
                     *
                     (
                         tb_min
-                        / tb_max.clamp(min=1e-6)
+                        /
+                        tb_max.clamp(
+                            min=1e-6
+                        )
                     )
                 )
 
                 center_target[
                     0,
-                    iy,
-                    ix,
-                ] = centerness
+                    valid
+                ] = centerness[valid]
 
-                positive_mask[
-                    iy,
-                    ix
-                ] = True
-
-                assigned_objects += 1
+                positive_mask |= valid
 
             # --------------------------------------------------
-            # Classification
+            # Classification loss.
             # --------------------------------------------------
 
             cls_loss_map = sigmoid_focal_loss(
@@ -444,11 +493,12 @@ def detection_loss(
 
                 total_cls += (
                     cls_loss_map.sum()
-                    / positive_count
+                    /
+                    positive_count
                 )
 
                 # --------------------------------------------------
-                # Box regression
+                # Box regression.
                 # --------------------------------------------------
 
                 pos = (
@@ -469,19 +519,14 @@ def detection_loss(
                     .reshape(-1, 4)
                 )
 
-                pos_indices = (
+                indices = (
                     positive_mask.nonzero(
                         as_tuple=False
                     )
                 )
 
-                pos_y = (
-                    pos_indices[:, 0]
-                )
-
-                pos_x = (
-                    pos_indices[:, 1]
-                )
+                pos_y = indices[:, 0]
+                pos_x = indices[:, 1]
 
                 point_x = (
                     pos_x.float() + 0.5
@@ -492,7 +537,7 @@ def detection_loss(
                 )
 
                 total_box += (
-                    box_iou_loss(
+                    box_iou_and_l1_loss(
                         pred_boxes,
                         target_boxes,
                         point_x,
@@ -501,7 +546,7 @@ def detection_loss(
                 )
 
                 # --------------------------------------------------
-                # Centerness
+                # Centerness loss.
                 # --------------------------------------------------
 
                 ctr_loss_map = (
@@ -512,7 +557,7 @@ def detection_loss(
                     )
                 )
 
-                # Weight positive center locations.
+                # Positive center locations receive more weight.
                 ctr_weights = torch.ones_like(
                     ctr_loss_map
                 )
@@ -524,19 +569,15 @@ def detection_loss(
                 total_ctr += (
                     (
                         ctr_loss_map
-                        * ctr_weights
+                        *
+                        ctr_weights
                     ).sum()
-                    / positive_count
-                )
-
-                total_positive += (
-                    num_positive
+                    /
+                    positive_count
                 )
 
             else:
 
-                # Keep background learning stable
-                # when an FPN level has no assigned object.
                 total_cls += (
                     cls_loss_map.mean()
                 )
@@ -548,30 +589,25 @@ def detection_loss(
                     )
                 )
 
-    normalizer = max(
+    total_cls /= max(
         num_images,
         1,
     )
 
-    total_cls = (
-        total_cls / normalizer
+    total_box /= max(
+        num_images,
+        1,
     )
 
-    total_box = (
-        total_box / normalizer
+    total_ctr /= max(
+        num_images,
+        1,
     )
 
-    total_ctr = (
-        total_ctr / normalizer
-    )
-
-    # V3 loss weighting.
-    loss = (
+    return (
         total_cls
         +
         total_box
         +
         0.5 * total_ctr
     )
-
-    return loss
