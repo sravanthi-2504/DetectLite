@@ -63,78 +63,66 @@ class MobileViTOptions(argparse.Namespace):
 
 
 class MobileViTBackbone(torch.nn.Module):
-
-    def __init__(self, mode="x_small"):
+    def __init__(
+        self,
+        mode="x_small",
+        pretrained_path="checkpoints/pretrained/mobilevit_xs.pt",
+    ):
         super().__init__()
 
         opts = MobileViTOptions(mode=mode)
-
         self.model = MobileViT(opts)
 
-        # Remove classification head.
+        if pretrained_path is not None:
+            checkpoint = torch.load(
+                pretrained_path,
+                map_location="cpu",
+            )
+
+            model_state = self.model.state_dict()
+
+            compatible = {
+                key: value
+                for key, value in checkpoint.items()
+                if key in model_state
+                and model_state[key].shape == value.shape
+            }
+
+            missing = [
+                key
+                for key in model_state
+                if key not in compatible
+                and not key.startswith("classifier.")
+            ]
+
+            if missing:
+                raise RuntimeError(
+                    "Missing pretrained MobileViT parameters: "
+                    + str(missing)
+                )
+
+            self.model.load_state_dict(
+                compatible,
+                strict=False,
+            )
+
+            print(
+                f"Loaded pretrained MobileViT weights: "
+                f"{len(compatible)} compatible parameters"
+            )
+
+        # Remove the ImageNet classification head.
         self.model.classifier = torch.nn.Identity()
 
     def forward(self, x):
-
-        x = self.model.conv_1(x)
-
-        x = self.model.layer_1(x)
-        f1 = x
-
-        x = self.model.layer_2(x)
-        f2 = x
-
-        x = self.model.layer_3(x)
-        f3 = x
-
-        x = self.model.layer_4(x)
-        f4 = x
-
-        x = self.model.layer_5(x)
-        f5 = x
+        features = self.model.extract_end_points_all(
+            x,
+            use_l5=True,
+            use_l5_exp=False,
+        )
 
         return {
-            "f1": f1,
-            "f2": f2,
-            "f3": f3,
-            "f4": f4,
-            "f5": f5,
+            "f3": features["out_l3"],
+            "f4": features["out_l4"],
+            "f5": features["out_l5"],
         }
-
-
-if __name__ == "__main__":
-
-    device = (
-        torch.device("mps")
-        if torch.backends.mps.is_available()
-        else torch.device("cpu")
-    )
-
-    print("Creating MobileViT-XS...")
-    print("Device:", device)
-
-    model = MobileViTBackbone(mode="x_small").to(device)
-    model.eval()
-
-    x = torch.randn(
-        1,
-        3,
-        224,
-        224,
-        device=device
-    )
-
-    print("Running forward pass...")
-
-    with torch.no_grad():
-        features = model(x)
-
-    print()
-    print("MobileViT Backbone Test")
-    print("-----------------------")
-
-    for name, feature in features.items():
-        print(
-            f"{name}: "
-            f"shape={tuple(feature.shape)}"
-        )
