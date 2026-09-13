@@ -26,6 +26,89 @@ def ap_from_pr(rec, prec):
     idx = torch.nonzero(mrec[1:] != mrec[:-1]).flatten() + 1
     return float(torch.sum((mrec[idx]-mrec[idx-1]) * mpre[idx]))
 
+@torch.no_grad()
+def compute_map(
+    model,
+    loader,
+    device,
+    iou_threshold=0.5,
+    score_threshold=0.05,
+    num_classes=20,
+    verbose=False,
+):
+    """
+    Compute VOC-style mAP for a model on a given dataloader.
+
+    Reusable entry point so training/train.py can call this for
+    per-epoch validation, without duplicating the AP logic that
+    lives in this file's CLI.
+
+    Returns:
+        mAP (float), per_class_ap (dict[int, float])
+    """
+    was_training = model.training
+    model.eval()
+
+    detections = defaultdict(list)
+    gt = defaultdict(lambda: defaultdict(list))
+
+    iterator = tqdm(loader, desc="Validating", leave=False) if verbose else loader
+    for images, targets in iterator:
+        images = images.to(device)
+        outputs = model(images)
+        boxes, scores, labels = decode_predictions(
+            outputs, score_threshold=score_threshold
+        )
+        for i, t in enumerate(targets):
+            image_id = t["image_id"]
+            for b, l in zip(t["boxes"], t["labels"]):
+                gt[int(l)][image_id].append(b.cpu())
+            for b, s, l in zip(boxes[i], scores[i], labels[i]):
+                detections[int(l)].append((float(s), b.cpu(), image_id))
+
+    per_class_ap = {}
+    for cls in range(num_classes):
+        n_gt = sum(len(v) for v in gt[cls].values())
+        if n_gt == 0:
+            continue
+        preds = sorted(detections[cls], key=lambda x: x[0], reverse=True)
+        matched = {k: torch.zeros(len(v), dtype=torch.bool) for k, v in gt[cls].items()}
+        tp = torch.zeros(len(preds))
+        fp = torch.zeros(len(preds))
+
+        for j, (_, pb, image_id) in enumerate(preds):
+            g = torch.stack(gt[cls].get(image_id, [])) if gt[cls].get(image_id) else torch.empty((0, 4))
+            if len(g) == 0:
+                fp[j] = 1
+                continue
+            ious = iou_one_to_many(pb, g)
+            best, idx = ious.max(0)
+            idx = int(idx)
+            if float(best) >= iou_threshold and not matched[image_id][idx]:
+                tp[j] = 1
+                matched[image_id][idx] = True
+            else:
+                fp[j] = 1
+
+        if len(preds):
+            tc, fc = torch.cumsum(tp, 0), torch.cumsum(fp, 0)
+            rec = tc / n_gt
+            prec = tc / (tc + fc).clamp(min=1e-12)
+            ap = ap_from_pr(rec, prec)
+        else:
+            ap = 0.0
+        per_class_ap[cls] = ap
+        if verbose:
+            print(f"class {cls:2d}: AP={ap:.4f}")
+
+    mAP = sum(per_class_ap.values()) / max(len(per_class_ap), 1)
+
+    if was_training:
+        model.train()
+
+    return mAP, per_class_ap
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True)
@@ -44,58 +127,13 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt["model"])
 
-    detections = defaultdict(list)
-    gt = defaultdict(lambda: defaultdict(list))
-
-    with torch.no_grad():
-        for images, targets in tqdm(loader, desc="Collecting detections"):
-            images = images.to(device)
-            outputs = model(images)
-            boxes, scores, labels = decode_predictions(
-                outputs, score_threshold=args.score_threshold
-            )
-            for i, t in enumerate(targets):
-                image_id = t["image_id"]
-                for b, l in zip(t["boxes"], t["labels"]):
-                    gt[int(l)][image_id].append(b.cpu())
-                for b, s, l in zip(boxes[i], scores[i], labels[i]):
-                    detections[int(l)].append((float(s), b.cpu(), image_id))
-
-    aps = []
-    for cls in range(20):
-        n_gt = sum(len(v) for v in gt[cls].values())
-        if n_gt == 0:
-            continue
-        preds = sorted(detections[cls], key=lambda x: x[0], reverse=True)
-        matched = {k: torch.zeros(len(v), dtype=torch.bool) for k, v in gt[cls].items()}
-        tp = torch.zeros(len(preds))
-        fp = torch.zeros(len(preds))
-
-        for j, (_, pb, image_id) in enumerate(preds):
-            g = torch.stack(gt[cls].get(image_id, [])) if gt[cls].get(image_id) else torch.empty((0,4))
-            if len(g) == 0:
-                fp[j] = 1
-                continue
-            ious = iou_one_to_many(pb, g)
-            best, idx = ious.max(0)
-            idx = int(idx)
-            if float(best) >= args.iou_threshold and not matched[image_id][idx]:
-                tp[j] = 1
-                matched[image_id][idx] = True
-            else:
-                fp[j] = 1
-
-        if len(preds):
-            tc, fc = torch.cumsum(tp,0), torch.cumsum(fp,0)
-            rec = tc / n_gt
-            prec = tc / (tc+fc).clamp(min=1e-12)
-            ap = ap_from_pr(rec, prec)
-        else:
-            ap = 0.0
-        aps.append(ap)
-        print(f"class {cls:2d}: AP={ap:.4f}")
-
-    print(f"mAP@{args.iou_threshold:.2f}: {sum(aps)/max(len(aps),1):.4f}")
+    mAP, _ = compute_map(
+        model, loader, device,
+        iou_threshold=args.iou_threshold,
+        score_threshold=args.score_threshold,
+        verbose=True,
+    )
+    print(f"mAP@{args.iou_threshold:.2f}: {mAP:.4f}")
 
 if __name__ == "__main__":
     main()

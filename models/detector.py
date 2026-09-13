@@ -7,10 +7,24 @@ from models.detection_head import DetectionHead
 
 
 class MobileViTDetector(nn.Module):
-    def __init__(self, num_classes=20, backbone_mode="x_small"):
+    def __init__(
+        self,
+        num_classes=20,
+        backbone_mode="x_small",
+        pretrained_backbone=True,
+        drop_rate=0.1,
+        drop_path_rate=0.1,
+    ):
         super().__init__()
-        self.backbone = MobileViTBackbone(mode=backbone_mode)
-        self.fpn = FPN(in_channels=(64, 80, 96), out_channels=96)
+        self.backbone = MobileViTBackbone(
+            mode=backbone_mode,
+            pretrained=pretrained_backbone,
+            drop_rate=drop_rate,
+            drop_path_rate=drop_path_rate,
+        )
+        # f5 from the timm backbone has 384 channels (it keeps MobileViT's
+        # final 1x1 expansion conv) rather than 96 in a from-scratch build.
+        self.fpn = FPN(in_channels=(64, 80, 384), out_channels=96)
         self.head = DetectionHead(channels=96, num_classes=num_classes)
 
     def forward(self, images):

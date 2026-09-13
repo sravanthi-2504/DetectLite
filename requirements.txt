@@ -13,3 +13,4 @@ requests
 av
 ftfy
 pycocotools
+timm>=1.0.0
