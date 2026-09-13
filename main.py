@@ -20,7 +20,7 @@ def main():
         "test": ["scripts/test_model.py"],
         "train": ["training/train.py"],
         "evaluate": ["training/evaluate.py"],
-        "profile": ["scripts/profile.py"],
+        "profile": ["scripts/model_profile.py"],
         "predict": ["inference/predict.py"],
         "webcam": ["inference/webcam.py"],
     }
